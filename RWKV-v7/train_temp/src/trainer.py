@@ -105,6 +105,22 @@ class train_callback(pl.Callback):
                 lll = {"loss": trainer.my_loss, "lr": trainer.my_lr, "wd": trainer.my_wd, "Gtokens": real_step * token_per_step / 1e9}
                 if kt_s > 0:
                     lll["kt/s"] = kt_s
+                
+                # --- NEW: Log Ternary Stats every 100 steps ---
+                if int(real_step) % 100 == 0:
+                    for name, module in pl_module.named_modules():
+                        if hasattr(module, '_ternarize'): # Detect BitLinear
+                            with torch.no_grad():
+                                W = module.weight
+                                beta = W.abs().mean().item()
+                                sparsity = 1.0
+                                if beta > 1e-9:
+                                    W_q = torch.clamp(torch.round(W / beta), -1.0, 1.0)
+                                    sparsity = (W_q == 0).float().mean().item()
+                                lll[f"tern/{name}/beta"] = beta
+                                lll[f"tern/{name}/sparsity"] = sparsity
+                # ----------------------------------------------
+
                 trainer.my_wandb.log(lll, step=int(real_step))
 
         if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy): # save pth

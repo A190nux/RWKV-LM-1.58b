@@ -419,6 +419,36 @@ else:
     def tmix_vres_gate_bf16_v1(v, v_first, v0, v12):
         return _forward_op(v, v_first, v0, v12)
 
+
+class BitLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__()
+        assert not bias, "RWKV-7 projections carry no bias; BitLinear does not support bias"
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def _ternarize(self, W: torch.Tensor):
+        beta   = W.detach().abs().mean()
+        W_q_hard = torch.clamp(torch.round(W / (beta + 1e-8)), -1.0, 1.0)
+        W_q = W + (W_q_hard - W).detach()
+        return W_q, beta
+
+    def _quantize_input(self, x: torch.Tensor):
+        gamma    = x.detach().abs().amax(dim=-1, keepdim=True) / 127.0
+        x_q_hard = torch.clamp(torch.round(x / (gamma + 1e-8)), -128.0, 127.0)
+        x_q = x + (x_q_hard - x).detach()
+        return x_q, gamma
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        W_q, beta  = self._ternarize(self.weight)
+        x_q, gamma = self._quantize_input(x)
+        out = F.linear(x_q, W_q)
+        out = out * (gamma * beta)
+        return out
+
+
 ########################################################################################################
 
 L2WRAP_CUDA_V2 = load(name="rwkv7_l2wrap_bf16_v2", sources=["cuda/rwkv7_l2wrap_bf16_v2.cpp","cuda/rwkv7_l2wrap_bf16_v2.cu"], extra_cflags=["-O3"],
@@ -506,10 +536,10 @@ class RWKV_Tmix_x070(MyModule):
             self.r_k = nn.Parameter(torch.zeros(H,N)-0.04)
 
             self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-            self.receptance = nn.Linear(C, C, bias=False)
-            self.key = nn.Linear(C, C, bias=False)
-            self.value = nn.Linear(C, C, bias=False)
-            self.output = nn.Linear(C, C, bias=False)
+            self.receptance = BitLinear(C, C, bias=False) # CHANGED
+            self.key = BitLinear(C, C, bias=False)        # CHANGED
+            self.value = BitLinear(C, C, bias=False)      # CHANGED
+            self.output = BitLinear(C, C, bias=False)     # CHANGED
             self.ln_x = nn.GroupNorm(H, C, eps=64e-5) # !!! notice eps value !!!
 
             self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
@@ -611,40 +641,12 @@ class RWKV_Tmix_x070(MyModule):
     
 ########################################################################################################
 
-# class RWKV_CMix_x070(MyModule): # slow pytorch version
-#     def __init__(self, args, layer_id):
-#         super().__init__()
-#         self.args = args
-#         self.layer_id = layer_id
-#         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-
-#         with torch.no_grad():
-#             ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
-#             ddd = torch.ones(1, 1, args.n_embd)
-#             for i in range(args.n_embd):
-#                 ddd[0, 0, i] = i / args.n_embd
-#             self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
-
-#         self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
-#         self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
-
-#         self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
-#         self.value.weight.data.zero_()
-
-#     @MyFunction
-#     def forward(self, x):
-#         xx = self.time_shift(x) - x
-        
-#         k = x + xx * self.x_k
-#         k = torch.relu(self.key(k)) ** 2
-
-#         return self.value(k)
-
-class RWKV_CMix_x070(nn.Module): # fast CUDA version
+class RWKV_CMix_x070(MyModule): # slow pytorch version
     def __init__(self, args, layer_id):
         super().__init__()
         self.args = args
         self.layer_id = layer_id
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
         with torch.no_grad():
             ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
@@ -659,8 +661,36 @@ class RWKV_CMix_x070(nn.Module): # fast CUDA version
         self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
         self.value.weight.data.zero_()
 
+    @MyFunction
     def forward(self, x):
-        return _CmixLayerV2Fn.apply(x, self.x_k.view(-1), self.key.weight, self.value.weight)
+        xx = self.time_shift(x) - x
+        
+        k = x + xx * self.x_k
+        k = torch.relu(self.key(k)) ** 2
+
+        return self.value(k)
+
+# class RWKV_CMix_x070(nn.Module): # fast CUDA version
+#     def __init__(self, args, layer_id):
+#         super().__init__()
+#         self.args = args
+#         self.layer_id = layer_id
+
+#         with torch.no_grad():
+#             ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
+#             ddd = torch.ones(1, 1, args.n_embd)
+#             for i in range(args.n_embd):
+#                 ddd[0, 0, i] = i / args.n_embd
+#             self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+
+#         self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
+#         self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
+
+#         self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
+#         self.value.weight.data.zero_()
+
+#     def forward(self, x):
+#         return _CmixLayerV2Fn.apply(x, self.x_k.view(-1), self.key.weight, self.value.weight)
 
 ########################################################################################################
 # The RWKV Model with our blocks

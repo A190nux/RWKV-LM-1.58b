@@ -19,8 +19,8 @@ PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 #
 #######################################################################################################################
 #
-M_BSZ="30" # for 80G VRAM GPUs
-LR_INIT="8e-4"
+M_BSZ="12" # for 80G VRAM GPUs
+LR_INIT="1e-3"
 LR_FINAL="3e-5"
 #
 W_DECAY="0.1"
@@ -33,11 +33,11 @@ EPOCH_SAVE=50 # save every 50 "miniepochs" (1 miniepoch = 40320 * ctx_len tokens
 #######################################################################################################################
 #
 N_NODE=1 # number of nodes
-GPU_PER_NODE=8 # number of GPUs per node
+GPU_PER_NODE=2 # number of GPUs per node
 #
 python train.py --load_model "0" --wandb "RWKV-7-Pile" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --train_stage 3 --epoch_count 999999 --epoch_begin 0 \
- --data_file "/mnt/nvme0n1/pile/pile_20B_tokenizer_text_document" --my_exit_tokens 332115325534 --magic_prime 81082817 \
+ --data_file "/mnt/nvme0n1/pile/pile_20B_tokenizer_text_document" --my_exit_tokens 1000000000 --magic_prime 81082817 \
  --num_nodes $N_NODE --micro_bsz $M_BSZ --n_layer $N_LAYER --n_embd $N_EMBD \
  --lr_init $LR_INIT --lr_final $LR_FINAL --warmup_steps 10 --beta1 0.9 --beta2 $BETA_2 --adam_eps $ADAM_EPS --data_type "binidx" --vocab_size 50304 \
  --weight_decay $W_DECAY --epoch_save $EPOCH_SAVE --head_size 64 \
