@@ -37,7 +37,7 @@ GPU_PER_NODE=2 # number of GPUs per node
 #
 python train.py --load_model "0" --wandb "RWKV-7-Pile" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --train_stage 3 --epoch_count 999999 --epoch_begin 0 \
- --data_file "/kaggle/working/data/minipile" --my_exit_tokens 1000000000 --magic_prime 81082817 \
+ --data_file "/kaggle/working/data/minipile" --my_exit_tokens 1498226207 --magic_prime 81082817 \
  --num_nodes $N_NODE --micro_bsz $M_BSZ --n_layer $N_LAYER --n_embd $N_EMBD \
  --lr_init $LR_INIT --lr_final $LR_FINAL --warmup_steps 10 --beta1 0.9 --beta2 $BETA_2 --adam_eps $ADAM_EPS --data_type "binidx" --vocab_size 50304 \
  --weight_decay $W_DECAY --epoch_save $EPOCH_SAVE --head_size 64 \
