@@ -757,7 +757,7 @@ class L2Wrap(torch.autograd.Function):
         maxx, ids = torch.max(y, -1, keepdim=True)
         gy = torch.zeros_like(y)
         gy.scatter_(-1, ids, maxx * factor)
-        return (grad_output, gy)
+        return (grad_output, grad_output * gy) # original (grad_output, gy) is buggy when grad_output != 1 !!!
 
 
 class RWKV(pl.LightningModule):
@@ -854,7 +854,7 @@ class RWKV(pl.LightningModule):
         # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         # return L2Wrap.apply(loss, logits)
         ############################################################
-        # much faster CUDA version (!!! fixed vocab 65536 and fixed 1e-4 factor !!!)
+        # much faster CUDA version (!!! fixed 1e-4 factor !!!)
         return l2wrap_cross_entropy(logits, targets)
 
     def training_step_end(self, batch_parts):
