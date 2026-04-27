@@ -20,7 +20,7 @@ PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 #######################################################################################################################
 #
 python train.py --wandb "" --proj_dir $PROJ_DIR \
- --data_file "/home/algonyx/Work/rkwv-1.58b/data/minipile" --data_type "binidx" --vocab_size 50304 --my_testing $MODEL_TYPE \
+ --data_file "/home/algonyx/Work/rkwv-1.58b/data/minipile" --data_type "binidx" --vocab_size 65536 --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --train_stage 1 --epoch_count 1 --epoch_begin 0 \
  --epoch_save 1 --weight_decay 0 --head_size 64 \
  --num_nodes 1 --micro_bsz 1 --n_layer $N_LAYER --n_embd $N_EMBD --my_exit_tokens 1498226207 --magic_prime 365759 \
