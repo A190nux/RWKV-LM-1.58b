@@ -28,6 +28,9 @@ if os.environ["RWKV_JIT_ON"] == "1":
     MyModule = torch.jit.ScriptModule
     MyFunction = torch.jit.script_method
 
+# os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = '4096' # saves 80% VRAM, slower
+# os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = '65536' # saves 70% VRAM, sometimes faster than '4096'
+os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = '0' # fast, takes more VRAM
 
 ########################################################################################################
 # CUDA Kernel
@@ -50,7 +53,7 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
     class RWKV7_CLAMPW_CUDA_OP(torch.autograd.Function):
         @staticmethod
         def forward(ctx,r,w,k,v,a,b):
-            B,T,H,N = r.shape 
+            B,T,H,N = r.shape
             assert T%CHUNK_LEN == 0 # if T%CHUNK_LEN != 0: pad your input to T%CHUNK_LEN == 0, or change CHUNK_LEN (will be slower)
             assert all(i.dtype==torch.bfloat16 for i in [r,w,k,v,a,b])
             assert all(i.is_contiguous() for i in [r,w,k,v,a,b])
@@ -451,7 +454,7 @@ class BitLinear(nn.Module):
 
 ########################################################################################################
 
-L2WRAP_CE_CUDA_V1 = load(name="rwkv7_l2wrap_ce_bf16_v1", sources=["cuda/rwkv7_l2wrap_ce_bf16_v1.cpp","cuda/rwkv7_l2wrap_ce_bf16_v1.cu"], extra_cflags=["-O3"],
+L2WRAP_CE_CUDA_V2 = load(name="rwkv7_l2wrap_ce_bf16_v2", sources=["cuda/rwkv7_l2wrap_ce_bf16_v2.cpp","cuda/rwkv7_l2wrap_ce_bf16_v2.cu"], extra_cflags=["-O3"],
      extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"],
      verbose=True)
 
@@ -460,14 +463,14 @@ class L2WrapCrossEntropyCUDA(torch.autograd.Function):
     def forward(ctx, logits, targets):
         logits = logits.contiguous()
         targets = targets.contiguous()
-        loss, lse, max_vals, argmax = L2WRAP_CE_CUDA_V1.forward(logits, targets)
+        loss, lse, max_vals, argmax = L2WRAP_CE_CUDA_V2.forward(logits, targets)
         ctx.save_for_backward(logits, targets.view(-1), lse, max_vals, argmax)
         return loss
 
     @staticmethod
     def backward(ctx, grad_output):
         logits, targets, lse, max_vals, argmax = ctx.saved_tensors
-        grad_logits = L2WRAP_CE_CUDA_V1.backward(
+        grad_logits = L2WRAP_CE_CUDA_V2.backward(
             grad_output.contiguous().float(),
             logits,
             targets,
@@ -479,6 +482,40 @@ class L2WrapCrossEntropyCUDA(torch.autograd.Function):
 
 def l2wrap_cross_entropy(logits, targets):
     return L2WrapCrossEntropyCUDA.apply(logits, targets)
+
+########################################################################################################
+
+if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0:
+    HEAD_L2WRAP_CE_CHUNK = int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"])
+    HEAD_L2WRAP_CE_CUDA_V4 = load(name="rwkv7_head_l2wrap_ce_bf16_v4", sources=["cuda/rwkv7_head_l2wrap_ce_bf16_v4.cpp","cuda/rwkv7_head_l2wrap_ce_bf16_v4.cu"], extra_cflags=["-O3", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
+         extra_cuda_cflags=['-res-usage', "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-DHEAD_CE_CHUNK={HEAD_L2WRAP_CE_CHUNK}"],
+         verbose=True)
+
+    class HeadL2WrapCrossEntropyCUDAV4(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, weight, targets):
+            hidden = hidden.contiguous()
+            weight = weight.contiguous()
+            targets = targets.contiguous()
+            loss, grad_hidden, grad_weight = HEAD_L2WRAP_CE_CUDA_V4.forward(
+                hidden,
+                weight,
+                targets,
+                HEAD_L2WRAP_CE_CHUNK,
+            )
+            ctx.save_for_backward(grad_hidden, grad_weight)
+            return loss
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            grad_hidden, grad_weight = ctx.saved_tensors
+            if grad_output.numel() == 1 and float(grad_output.detach()) == 1.0:
+                return grad_hidden, grad_weight, None
+            scale = grad_output.to(dtype=torch.float32)
+            return grad_hidden * scale.to(grad_hidden.dtype), grad_weight * scale.to(grad_weight.dtype), None
+
+    def head_l2wrap_cross_entropy(hidden, weight, targets):
+        return HeadL2WrapCrossEntropyCUDAV4.apply(hidden, weight, targets)
 
 ########################################################################################################
 
@@ -660,7 +697,7 @@ class RWKV_Tmix_x070(MyModule):
         ############################################################
 
         return x, v_first
-    
+
 ########################################################################################################
 
 class RWKV_CMix_x070(MyModule): # slow pytorch version
@@ -732,7 +769,7 @@ class Block(nn.Module):
 
         self.att = RWKV_Tmix_x070(args, layer_id)
         self.ffn = RWKV_CMix_x070(args, layer_id)
-        
+
     def forward(self, x, v_first):
         if self.layer_id == 0:
             x = self.ln0(x)
@@ -744,20 +781,20 @@ class Block(nn.Module):
         return x, v_first
 
 
-class L2Wrap(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, loss, y):
-        ctx.save_for_backward(y)
-        return loss
+# class L2Wrap(torch.autograd.Function): # avoid: very slow and takes lots of vram
+#     @staticmethod
+#     def forward(ctx, loss, y):
+#         ctx.save_for_backward(y)
+#         return loss
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        y = ctx.saved_tensors[0]
-        factor = 1e-4 / (y.shape[0] * y.shape[1])
-        maxx, ids = torch.max(y, -1, keepdim=True)
-        gy = torch.zeros_like(y)
-        gy.scatter_(-1, ids, maxx * factor)
-        return (grad_output, grad_output * gy) # original (grad_output, gy) is buggy when grad_output != 1 !!!
+#     @staticmethod
+#     def backward(ctx, grad_output):
+#         y = ctx.saved_tensors[0]
+#         factor = 1e-4 / (y.shape[0] * y.shape[1])
+#         maxx, ids = torch.max(y, -1, keepdim=True)
+#         gy = torch.zeros_like(y)
+#         gy.scatter_(-1, ids, maxx * factor)
+#         return (grad_output, grad_output * gy) # original (grad_output, gy) is buggy when grad_output != 1 !!!
 
 
 class RWKV(pl.LightningModule):
@@ -767,7 +804,7 @@ class RWKV(pl.LightningModule):
         if not hasattr(args, 'dim_att'):
             args.dim_att = args.n_embd
         if not hasattr(args, 'dim_ffn'):
-            args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size            
+            args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size
         assert args.n_embd % 32 == 0
         assert args.dim_att % 32 == 0
         assert args.dim_ffn % 32 == 0
@@ -781,7 +818,7 @@ class RWKV(pl.LightningModule):
 
     def configure_optimizers(self):
         args = self.args
-        
+
         lr_decay = set()
         lr_1x = set()
         lr_2x = set()
@@ -803,7 +840,7 @@ class RWKV(pl.LightningModule):
             print('2x', lr_2x, '\n')
 
         param_dict = {n: p for n, p in self.named_parameters()}
-        
+
         optim_groups = [
             {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
             {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0},
@@ -827,7 +864,7 @@ class RWKV(pl.LightningModule):
             return cfg.get("offload_optimizer") or cfg.get("offload_param")
         return False
 
-    def forward(self, idx):
+    def _forward_features(self, idx):
         args = self.args
         B, T = idx.size()
         assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
@@ -842,20 +879,36 @@ class RWKV(pl.LightningModule):
                 x, v_first = block(x, v_first)
 
         x = self.ln_out(x)
-        x = self.head(x)
         return x
 
-    def training_step(self, batch, batch_idx):
-        idx, targets = batch
-        logits = self(idx)
-      
-        ############################################################
-        # slow pytorch version (!!! SLOW AND TAKES 40% MORE VRAM !!!)
-        # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        # return L2Wrap.apply(loss, logits)
-        ############################################################
-        # much faster CUDA version (!!! fixed 1e-4 factor !!!)
-        return l2wrap_cross_entropy(logits, targets)
+    if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0: # saves 70~80% VRAM
+
+        def forward(self, idx):
+            return self._forward_features(idx)
+
+        def training_step(self, batch, batch_idx):
+            idx, targets = batch
+            hidden = self(idx)
+            return head_l2wrap_cross_entropy(hidden, self.head.weight, targets)
+
+    else:
+
+        def forward(self, idx):
+            x = self._forward_features(idx)
+            x = self.head(x)
+            return x
+
+        def training_step(self, batch, batch_idx):
+            idx, targets = batch
+            logits = self(idx)
+
+            ############################################################
+            # slow pytorch version (!!! SLOW AND TAKES 40% MORE VRAM !!!)
+            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # return L2Wrap.apply(loss, logits)
+            ############################################################
+            # much faster CUDA version (!!! fixed 1e-4 factor !!!)
+            return l2wrap_cross_entropy(logits, targets)
 
     def training_step_end(self, batch_parts):
         all = self.all_gather(batch_parts)
